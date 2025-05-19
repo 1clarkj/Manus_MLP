@@ -8,6 +8,9 @@ import threading
 import warnings
 warnings.filterwarnings("ignore", message="X does not have valid feature names.*")
 
+# Load trained model and scaler
+model = joblib.load("mlp_model1.pkl")
+scaler = joblib.load("minmax_scaler.pkl")
 
 # UDP server setup
 UDP_IP = "192.168.0.139"
