@@ -60,6 +60,26 @@ maze_walls = [
 # GUI update lock
 position_lock = threading.Lock()
 
+# UDP Receiver
+recv_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+recv_socket.bind(("192.168.0.1", 6006))  # Replace with your IP and port
+
+def listen_for_position():
+    global ball_pos
+    while True:
+        try:
+            data, _ = recv_socket.recvfrom(1024)
+            pos = np.frombuffer(data, dtype=np.float32)
+            x_mm = pos[0]
+            y_mm = pos[1]
+            with position_lock:
+                ball_pos = [x_mm / MAX_WIDTH_MM, y_mm / MAX_HEIGHT_MM]
+            
+        except Exception as e:
+            print(f"Error in position receive/forward: {e}")
+
+threading.Thread(target=listen_for_position, daemon=True).start()
+
 # # UDP server setup
 # UDP_IP = "127.0.0.1"
 # UDP_PORT = 5005
