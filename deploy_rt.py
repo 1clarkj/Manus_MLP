@@ -62,7 +62,7 @@ position_lock = threading.Lock()
 
 # UDP Receiver
 recv_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-recv_socket.bind(("192.168.0.1", 6006))  # Replace with your IP and port
+recv_socket.bind(("192.168.0.115", 6006))  # Replace with your IP and port
 
 def listen_for_position():
     global ball_pos
