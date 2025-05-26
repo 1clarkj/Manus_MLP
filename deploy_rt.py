@@ -14,8 +14,7 @@ model = joblib.load("mlp_model1.pkl")
 scaler = joblib.load("minmax_scaler.pkl")
 
 #Raspberry Pi IP and port for sending hand data via UDP
-raspberry_pi_ip = "192.168.X.X"  # Replace with actual Pi IP
-raspberry_pi_port = 5006
+
 raspi_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 
@@ -25,10 +24,10 @@ MAX_HEIGHT_MM = 285
 TARGET_ASPECT = MAX_WIDTH_MM / MAX_HEIGHT_MM  
 
 # Initial ball position
-ball_x, ball_y = 30, 30
+ball_x, ball_y = 300, 42
 actual_pos=ball_pos_mm = [ball_x, ball_y]  # center
 ball_radius_mm = 20
-step_size_mm = 1.0
+step_size_mm = 7.0
 
 # Normalize
 ball_pos = [ball_pos_mm[0] / MAX_WIDTH_MM, ball_pos_mm[1] / MAX_HEIGHT_MM]
@@ -102,9 +101,14 @@ def listen_for_actual_position():
             data, _ = sock.recvfrom(1024)
             pos = np.frombuffer(data, dtype=np.float32)
             if pos.shape == (2,):
+                print(f"Received actual position: {pos}")
+                 # Convert Pi coordinates (center-origin, mm) → GUI normalized (top-left origin)
+                x_mm = pos[0] + (MAX_WIDTH_MM / 2)
+                y_mm = (MAX_HEIGHT_MM / 2) - pos[1]
+
                 with position_lock:
-                    actual_pos[0] = pos[0] / MAX_WIDTH_MM
-                    actual_pos[1] = pos[1] / MAX_HEIGHT_MM
+                    actual_pos[0] = x_mm / MAX_WIDTH_MM
+                    actual_pos[1] = y_mm / MAX_HEIGHT_MM
         except Exception as e:
             print(f"Error in actual position receive: {e}")
 
@@ -119,7 +123,8 @@ def udp_listener():
         try:
             data, addr = sock.recvfrom(2048)
             floats = np.frombuffer(data, dtype=np.float32)
-            raspi_socket.sendto(floats.tobytes(), (raspberry_pi_ip, raspberry_pi_port))
+            raspi_socket.sendto(floats.tobytes(), (send_ip, send_port))
+
 
             if floats.shape[0] != 40:
                 print(f"Invalid input: got {floats.shape[0]} floats")
@@ -181,6 +186,12 @@ def draw_maze():
             x1 * w, y1 * h, x2 * w, y2 * h,
             fill="black", width=thickness_px, tags="maze"
         )
+
+def reset_ball_position():
+    with position_lock:
+        ball_pos[0] = ball_x / MAX_WIDTH_MM
+        ball_pos[1] = ball_y / MAX_HEIGHT_MM
+    print("Ball position reset to initial coordinates.")
 
 def draw_balls():
     canvas.delete("ball")
@@ -247,11 +258,16 @@ def try_move_ball(x_dir, y_dir):
         if not y_collides:
             ball_pos[1] = new_y
 
+    # Add: collision from actual position
+    with position_lock:
+        actual_x, actual_y = actual_pos
+    actual_collides = hits_wall(actual_x, actual_y)
+
     # Send collision signal to C++
-    if x_collides:
+    if x_collides or actual_collides:
         feedback_sender.send_flag(b"1")  # Left hand vibration
         print("Collision detected on X axis")
-    elif y_collides:
+    elif y_collides or actual_collides:
         feedback_sender.send_flag(b"2")  # Right hand vibration
         print("Collision detected on Y axis")
     else:
@@ -276,18 +292,20 @@ root.rowconfigure(0, weight=1)
 main_frame.columnconfigure(0, weight=1)
 main_frame.rowconfigure(0, weight=1)
 
+
 # IP and Port input
 ttk.Label(main_frame, text="Send IP:").grid(row=1, column=0, sticky="e")
 ip_entry = ttk.Entry(main_frame)
-ip_entry.insert(0, "127.0.0.1")
+ip_entry.insert(0, "192.168.0.139")
 ip_entry.grid(row=1, column=1)
 
 ttk.Label(main_frame, text="Send Port:").grid(row=2, column=0, sticky="e")
 port_entry = ttk.Entry(main_frame)
-port_entry.insert(0, "6006")
+port_entry.insert(0, "5006")
 port_entry.grid(row=2, column=1)
 
 ttk.Button(main_frame, text="Apply", command=apply_ip).grid(row=3, column=0, columnspan=2)
+ttk.Button(main_frame, text="Reset Ball", command=reset_ball_position).grid(row=4, column=0, columnspan=2, pady=(10, 0))
 
 # Set up UDP sender
 sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -295,6 +313,10 @@ sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 feedback_sender = CollisionFeedbackSender("127.0.0.1", 6006)
 udp_thread = threading.Thread(target=udp_listener, daemon=True)
 udp_thread.start()
+
+position_thread = threading.Thread(target=listen_for_actual_position, daemon=True)
+position_thread.start()
+
 # Start GUI loop
 update_gui()
 root.mainloop()
