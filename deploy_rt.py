@@ -6,11 +6,18 @@ import tkinter as tk
 from tkinter import ttk
 import threading
 import warnings
+import queue
 warnings.filterwarnings("ignore", message="X does not have valid feature names.*")
 
 # Load trained model and scaler
 model = joblib.load("mlp_model1.pkl")
 scaler = joblib.load("minmax_scaler.pkl")
+
+#Raspberry Pi IP and port for sending hand data via UDP
+raspberry_pi_ip = "192.168.X.X"  # Replace with actual Pi IP
+raspberry_pi_port = 5006
+raspi_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
 
 # Maze dimensions in mm
 MAX_WIDTH_MM = 355
@@ -18,8 +25,8 @@ MAX_HEIGHT_MM = 285
 TARGET_ASPECT = MAX_WIDTH_MM / MAX_HEIGHT_MM  
 
 # Initial ball position
-ball_x, ball_y = 177.5, 142.5
-ball_pos_mm = [ball_x, ball_y]  # center
+ball_x, ball_y = 30, 30
+actual_pos=ball_pos_mm = [ball_x, ball_y]  # center
 ball_radius_mm = 20
 step_size_mm = 1.0
 
@@ -60,46 +67,83 @@ maze_walls = [
 # GUI update lock
 position_lock = threading.Lock()
 
-# UDP Receiver
-recv_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-recv_socket.bind(("192.168.0.115", 6006))  # Replace with your IP and port
+class CollisionFeedbackSender:
+    def __init__(self, target_ip="127.0.0.1", target_port=6006):
+        self.target_ip = target_ip
+        self.target_port = target_port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.msg_queue = queue.Queue()
+        self.running = True
+        self.thread = threading.Thread(target=self._feedback_loop, daemon=True)
+        self.thread.start()
 
-def listen_for_position():
-    global ball_pos
+    def send_flag(self, flag_bytes: bytes):
+        self.msg_queue.put(flag_bytes)
+
+    def _feedback_loop(self):
+        while self.running:
+            try:
+                msg = self.msg_queue.get(timeout=1)
+                self.sock.sendto(msg, (self.target_ip, self.target_port))
+            except queue.Empty:
+                continue
+
+    def stop(self):
+        self.running = False
+        self.thread.join()
+
+
+def listen_for_actual_position():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", 6007))  # Listen for position from the Pi
+
     while True:
         try:
-            data, _ = recv_socket.recvfrom(1024)
+            data, _ = sock.recvfrom(1024)
             pos = np.frombuffer(data, dtype=np.float32)
-            x_mm = pos[0]
-            y_mm = pos[1]
-            with position_lock:
-                ball_pos = [x_mm / MAX_WIDTH_MM, y_mm / MAX_HEIGHT_MM]
-            
+            if pos.shape == (2,):
+                with position_lock:
+                    actual_pos[0] = pos[0] / MAX_WIDTH_MM
+                    actual_pos[1] = pos[1] / MAX_HEIGHT_MM
         except Exception as e:
-            print(f"Error in position receive/forward: {e}")
+            print(f"Error in actual position receive: {e}")
 
-threading.Thread(target=listen_for_position, daemon=True).start()
+def udp_listener():
+    UDP_IP = "127.0.0.1"
+    UDP_PORT = 5005
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((UDP_IP, UDP_PORT))
+    print(f"Listening for hand data on {UDP_IP}:{UDP_PORT}")
 
-# # UDP server setup
-# UDP_IP = "127.0.0.1"
-# UDP_PORT = 5005
-# sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-# sock.bind((UDP_IP, UDP_PORT))
-# print(f"Listening on {UDP_IP}:{UDP_PORT}")  
+    while True:
+        try:
+            data, addr = sock.recvfrom(2048)
+            floats = np.frombuffer(data, dtype=np.float32)
+            raspi_socket.sendto(floats.tobytes(), (raspberry_pi_ip, raspberry_pi_port))
 
-# while True:
-#     try:
-#         data, addr = sock.recvfrom(1024)
-#         input_data = np.frombuffer(data, dtype=np.float32).reshape(1, -1)
+            if floats.shape[0] != 40:
+                print(f"Invalid input: got {floats.shape[0]} floats")
+                continue
 
-#         # Apply the same normalization
-#         input_data_scaled = scaler.transform(input_data)
+            left_hand = floats[:20].reshape(1, -1)
+            right_hand = floats[20:].reshape(1, -1)
 
-#         # Predict and print softmax probabilities
-#         probs = model.predict_proba(input_data_scaled)
-#         print(f"Softmax Probabilities: {probs}")
-#     except Exception as e:
-#         print(f"Error: {e}")
+            # Normalize
+            left_scaled = scaler.transform(left_hand)
+            right_scaled = scaler.transform(right_hand)
+
+            # Predict and threshold
+            left_probs = model.predict_proba(left_scaled)[0]
+            right_probs = model.predict_proba(right_scaled)[0]
+
+            # Apply threshold
+            x_class = np.argmax(left_probs) + 1 if np.max(left_probs) >= 0.93 else 0
+            y_class = np.argmax(right_probs) + 1 if np.max(right_probs) >= 0.93 else 0
+
+            try_move_ball(x_class, y_class)
+
+        except Exception as e:
+            print(f"UDP listener error: {e}")
 
 
 def resize_canvas(event):
@@ -114,11 +158,11 @@ def resize_canvas(event):
         canvas.config(width=w, height=new_height)
 
     draw_maze()
-    draw_ball()
+    draw_balls()
 
 def update_gui():
     draw_maze()
-    draw_ball()
+    draw_balls()
     root.after(50, update_gui)
 
 def apply_ip():
@@ -138,14 +182,24 @@ def draw_maze():
             fill="black", width=thickness_px, tags="maze"
         )
 
-def draw_ball():
+def draw_balls():
     canvas.delete("ball")
     w, h = canvas.winfo_width(), canvas.winfo_height()
-    x, y = ball_pos
     r = ball_radius
+
+    with position_lock:
+        x1, y1 = ball_pos
+        x2, y2 = actual_pos
+
+    # Predicted (blue)
     canvas.create_oval(
-        (x - r) * w, (y - r) * h, (x + r) * w, (y + r) * h,
+        (x1 - r) * w, (y1 - r) * h, (x1 + r) * w, (y1 + r) * h,
         fill="blue", tags="ball"
+    )
+    # Actual (green)
+    canvas.create_oval(
+        (x2 - r) * w, (y2 - r) * h, (x2 + r) * w, (y2 + r) * h,
+        fill="green", tags="ball"
     )
 
 def get_wall_thickness_px():
@@ -155,6 +209,55 @@ def get_wall_thickness_px():
     px_x = wall_thickness_mm * (w_px / MAX_WIDTH_MM)
     px_y = wall_thickness_mm * (h_px / MAX_HEIGHT_MM)
     return int((px_x + px_y) / 2)  # average thickness in pixels
+
+def point_to_segment_dist(px, py, x1, y1, x2, y2):
+    dx, dy = x2 - x1, y2 - y1
+    if dx == dy == 0:
+        return ((px - x1)**2 + (py - y1)**2)**0.5
+
+    t = max(0, min(1, ((px - x1)*dx + (py - y1)*dy) / (dx**2 + dy**2)))
+    proj_x = x1 + t * dx
+    proj_y = y1 + t * dy
+    return ((px - proj_x)**2 + (py - proj_y)**2)**0.5
+
+def hits_wall(x, y):
+    for x1, y1, x2, y2 in maze_walls:
+        if point_to_segment_dist(x, y, x1, y1, x2, y2) <= ball_radius:
+            return True
+    return False
+
+def try_move_ball(x_dir, y_dir):
+    dx = (step_size if x_dir == 2 else -step_size if x_dir == 1 else 0)
+    dy = (step_size if y_dir == 2 else -step_size if y_dir == 1 else 0)
+
+    new_x = ball_pos[0] + dx
+    new_y = ball_pos[1] + dy
+
+    # Clamp to within bounds
+    new_x = max(ball_radius, min(1 - ball_radius, new_x))
+    new_y = max(ball_radius, min(1 - ball_radius, new_y))
+
+    x_collides = hits_wall(new_x, ball_pos[1])
+    y_collides = hits_wall(ball_pos[0], new_y)
+
+    # If either direction collides, don't update that axis
+    with position_lock:
+        if not x_collides:
+            ball_pos[0] = new_x
+        if not y_collides:
+            ball_pos[1] = new_y
+
+    # Send collision signal to C++
+    if x_collides:
+        feedback_sender.send_flag(b"1")  # Left hand vibration
+        print("Collision detected on X axis")
+    elif y_collides:
+        feedback_sender.send_flag(b"2")  # Right hand vibration
+        print("Collision detected on Y axis")
+    else:
+        feedback_sender.send_flag(b"0")  # No collision
+        
+
 
 # Set up GUI
 root = tk.Tk()
@@ -189,6 +292,9 @@ ttk.Button(main_frame, text="Apply", command=apply_ip).grid(row=3, column=0, col
 # Set up UDP sender
 sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+feedback_sender = CollisionFeedbackSender("127.0.0.1", 6006)
+udp_thread = threading.Thread(target=udp_listener, daemon=True)
+udp_thread.start()
 # Start GUI loop
 update_gui()
 root.mainloop()

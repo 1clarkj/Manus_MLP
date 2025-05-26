@@ -1,34 +1,56 @@
+# import socket
+# import joblib
+# import numpy as np
+# from sklearn.preprocessing import MinMaxScaler
+# import tkinter as tk
+# from tkinter import ttk
+# import threading
+# import warnings
+# warnings.filterwarnings("ignore", message="X does not have valid feature names.*")
+
+# # Load trained model and scaler
+# model = joblib.load("mlp_model1.pkl")
+# scaler = joblib.load("minmax_scaler.pkl")
+
+# # UDP server setup
+# UDP_IP = "192.168.0.139"
+# UDP_PORT = 5005
+# sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+# sock.bind((UDP_IP, UDP_PORT))
+# print(f"Listening on {UDP_IP}:{UDP_PORT}")  
+
+# while True:
+#     try:
+#         data, addr = sock.recvfrom(1024)
+#         input_data = np.frombuffer(data, dtype=np.float32).reshape(1, -1)
+
+#         # Apply the same normalization
+#         input_data_scaled = scaler.transform(input_data)
+
+#         # Predict and print softmax probabilities
+#         probs = model.predict_proba(input_data_scaled)
+#         print(f"Softmax Probabilities: {probs}")
+#     except Exception as e:
+#         print(f"Error: {e}")
+
 import socket
-import joblib
-import numpy as np
-from sklearn.preprocessing import MinMaxScaler
-import tkinter as tk
-from tkinter import ttk
-import threading
-import warnings
-warnings.filterwarnings("ignore", message="X does not have valid feature names.*")
 
-# Load trained model and scaler
-model = joblib.load("mlp_model1.pkl")
-scaler = joblib.load("minmax_scaler.pkl")
+# === CONFIGURATION ===
+LISTEN_IP = "0.0.0.0"    # Listen on all interfaces
+LISTEN_PORT = 6006       # Match the C++ sender's destination port
 
-# UDP server setup
-UDP_IP = "192.168.0.139"
-UDP_PORT = 5005
+print(f"Listening for UDP packets on {LISTEN_IP}:{LISTEN_PORT}...")
+
+# === SETUP SOCKET ===
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind((UDP_IP, UDP_PORT))
-print(f"Listening on {UDP_IP}:{UDP_PORT}")  
+sock.bind((LISTEN_IP, LISTEN_PORT))
 
-while True:
-    try:
-        data, addr = sock.recvfrom(1024)
-        input_data = np.frombuffer(data, dtype=np.float32).reshape(1, -1)
-
-        # Apply the same normalization
-        input_data_scaled = scaler.transform(input_data)
-
-        # Predict and print softmax probabilities
-        probs = model.predict_proba(input_data_scaled)
-        print(f"Softmax Probabilities: {probs}")
-    except Exception as e:
-        print(f"Error: {e}")
+# === RECEIVE LOOP ===
+try:
+    while True:
+        data, addr = sock.recvfrom(1024)  # buffer size
+        print(f"Received from {addr}: {data} (decoded: {data.decode(errors='ignore')})")
+except KeyboardInterrupt:
+    print("\nReceiver stopped by user.")
+finally:
+    sock.close()
