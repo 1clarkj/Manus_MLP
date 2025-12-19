@@ -10,7 +10,7 @@ import queue
 warnings.filterwarnings("ignore", message="X does not have valid feature names.*")
 
 # Load trained model and scaler
-model = joblib.load("mlp_model1.pkl")
+model = joblib.load("mlp_model.pkl")
 scaler = joblib.load("minmax_scaler.pkl")
 
 #Raspberry Pi IP and port for sending hand data via UDP
