@@ -1,5 +1,6 @@
 import socket
 import joblib
+from pathlib import Path
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 import tkinter as tk
@@ -9,9 +10,14 @@ import warnings
 import queue
 warnings.filterwarnings("ignore", message="X does not have valid feature names.*")
 
+
+ROOT = Path(__file__).resolve().parents[1]  # repo root
+ARTIFACTS = ROOT / "artifacts"
+
+
 # Load trained model and scaler
-model = joblib.load("mlp_model.pkl")
-scaler = joblib.load("minmax_scaler.pkl")
+model = joblib.load(ARTIFACTS/"mlp_model.pkl")
+scaler = joblib.load(ARTIFACTS/"minmax_scaler.pkl")
 
 #Raspberry Pi IP and port for sending hand data via UDP
 
@@ -113,7 +119,7 @@ def listen_for_actual_position():
             print(f"Error in actual position receive: {e}")
 
 def udp_listener():
-    UDP_IP = "127.0.0.1"
+    UDP_IP = "127.0.0.1" #listen to local SDK 
     UDP_PORT = 5005
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
