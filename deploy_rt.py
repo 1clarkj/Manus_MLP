@@ -238,7 +238,7 @@ def hits_wall(x, y):
     return False
 
 def try_move_ball(x_dir, y_dir):
-    dx = (step_size if x_dir == 2 else -step_size if x_dir == 1 else 0)
+    dx = (step_size if x_dir == 1 else -step_size if x_dir == 2 else 0)
     dy = (step_size if y_dir == 2 else -step_size if y_dir == 1 else 0)
 
     new_x = ball_pos[0] + dx
