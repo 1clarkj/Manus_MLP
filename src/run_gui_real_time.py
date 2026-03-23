@@ -8,6 +8,8 @@ from tkinter import ttk
 import threading
 import warnings
 import queue
+import json
+import ipaddress
 warnings.filterwarnings("ignore", message="X does not have valid feature names.*")
 
 
@@ -22,6 +24,20 @@ scaler = joblib.load(ARTIFACTS/"minmax_scaler.pkl")
 #Raspberry Pi IP and port for sending hand data via UDP
 
 raspi_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+send_ip = "127.0.0.1"
+send_port = 5006
+target_seq = 0
+
+PI_HOSTNAME = "raspberrypi.local"
+PI_HANDSHAKE_PORT = 8008
+GUI_HANDSHAKE_REPLY_PORT = 53256
+POSITION_LISTEN_PORT = 6007
+
+GESTURE_TO_COMMAND = {
+    0: 1,  # pointing
+    1: 2,  # thumbs_up
+    2: 0,  # okay_sign -> neutral/no movement
+}
 
 
 # Maze dimensions in mm
@@ -100,7 +116,7 @@ class CollisionFeedbackSender:
 
 def listen_for_actual_position():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("0.0.0.0", 6007))  # Listen for position from the Pi
+    sock.bind(("0.0.0.0", POSITION_LISTEN_PORT))  # Listen for position from the Pi
 
     while True:
         try:
@@ -129,7 +145,6 @@ def udp_listener():
         try:
             data, addr = sock.recvfrom(2048)
             floats = np.frombuffer(data, dtype=np.float32)
-            raspi_socket.sendto(floats.tobytes(), (send_ip, send_port))
 
 
             if floats.shape[0] != 40:
@@ -143,15 +158,25 @@ def udp_listener():
             left_scaled = scaler.transform(left_hand)
             right_scaled = scaler.transform(right_hand)
 
-            # Predict and threshold
+            # Predict gestures, then map to command IDs used by try_move_ball.
             left_probs = model.predict_proba(left_scaled)[0]
             right_probs = model.predict_proba(right_scaled)[0]
 
-            # Apply threshold
-            x_class = np.argmax(left_probs) + 1 if np.max(left_probs) >= 0.93 else 0
-            y_class = np.argmax(right_probs) + 1 if np.max(right_probs) >= 0.93 else 0
+            # Confidence gate: if confidence is too low, treat as neutral command.
+            if np.max(left_probs) >= 0.93:
+                left_gesture = int(np.argmax(left_probs))
+                x_class = GESTURE_TO_COMMAND.get(left_gesture, 0)
+            else:
+                x_class = 0
+
+            if np.max(right_probs) >= 0.93:
+                right_gesture = int(np.argmax(right_probs))
+                y_class = GESTURE_TO_COMMAND.get(right_gesture, 0)
+            else:
+                y_class = 0
 
             try_move_ball(x_class, y_class)
+            send_target_position()
 
         except Exception as e:
             print(f"UDP listener error: {e}")
@@ -180,6 +205,122 @@ def apply_ip():
     global send_ip, send_port
     send_ip = ip_entry.get()
     send_port = int(port_entry.get())
+    send_position_subscribe(send_ip, send_port, POSITION_LISTEN_PORT)
+
+def apply_remote_endpoint(ip: str, port: int):
+    global send_ip, send_port
+    send_ip = ip
+    send_port = int(port)
+    ip_entry.delete(0, tk.END)
+    ip_entry.insert(0, send_ip)
+    port_entry.delete(0, tk.END)
+    port_entry.insert(0, str(send_port))
+
+def send_position_subscribe(pi_ip: str, pi_control_port: int, position_port: int):
+    payload = {
+        "type": "position_subscribe",
+        "position_port": int(position_port),
+    }
+    try:
+        raspi_socket.sendto(json.dumps(payload).encode("utf-8"), (pi_ip, int(pi_control_port)))
+        print(f"Sent position_subscribe to {pi_ip}:{pi_control_port} (position_port={position_port})")
+    except Exception as e:
+        print(f"Failed to send position_subscribe: {e}")
+
+def send_target_position():
+    global target_seq
+    with position_lock:
+        x_norm, y_norm = ball_pos[0], ball_pos[1]
+
+    # GUI frame (top-left origin) -> Pi frame (center origin, +Y up), in mm.
+    x_mm_gui = x_norm * MAX_WIDTH_MM
+    y_mm_gui = y_norm * MAX_HEIGHT_MM
+    x_mm = x_mm_gui - (MAX_WIDTH_MM / 2)
+    y_mm = (MAX_HEIGHT_MM / 2) - y_mm_gui
+
+    payload = {
+        "type": "target_position",
+        "x_mm": float(x_mm),
+        "y_mm": float(y_mm),
+        "seq": target_seq,
+    }
+    target_seq += 1
+
+    try:
+        raspi_socket.sendto(json.dumps(payload).encode("utf-8"), (send_ip, int(send_port)))
+    except Exception as e:
+        print(f"Failed to send target_position: {e}")
+
+def discover_pi_endpoint(
+    hostname: str = PI_HOSTNAME,
+    handshake_port: int = PI_HANDSHAKE_PORT,
+    reply_port: int = GUI_HANDSHAKE_REPLY_PORT,
+    retries: int = 3,
+    timeout_s: float = 2.0
+):
+    try:
+        resolved_ip = socket.gethostbyname(hostname)
+    except socket.gaierror:
+        resolved_ip = None
+
+    def valid_ipv4(ip: str) -> bool:
+        try:
+            addr = ipaddress.ip_address(ip)
+            return addr.version == 4 and not addr.is_unspecified
+        except ValueError:
+            return False
+
+    payload = {
+        "type": "discover",
+        "reply_port": reply_port,
+        "position_port": POSITION_LISTEN_PORT,
+    }
+    encoded_payload = json.dumps(payload).encode("utf-8")
+
+    listen_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen_sock.bind(("0.0.0.0", reply_port))
+    listen_sock.settimeout(timeout_s)
+
+    target_ips = []
+    if resolved_ip and valid_ipv4(resolved_ip):
+        target_ips.append(resolved_ip)
+    if "255.255.255.255" not in target_ips:
+        target_ips.append("255.255.255.255")
+
+    sender_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sender_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+    try:
+        for attempt in range(1, retries + 1):
+            for target_ip in target_ips:
+                try:
+                    sender_sock.sendto(encoded_payload, (target_ip, handshake_port))
+                    print(f"Handshake discover attempt {attempt}: {target_ip}:{handshake_port}")
+                except OSError as e:
+                    print(f"Handshake send failed for {target_ip}:{handshake_port} -> {e}")
+            try:
+                data, addr = listen_sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+
+            try:
+                msg = json.loads(data.decode("utf-8"))
+            except json.JSONDecodeError:
+                msg = {}
+
+            if isinstance(msg, dict) and msg.get("type") == "ack":
+                # Use packet source as authoritative Pi address.
+                pi_ip = addr[0]
+                pi_port = int(msg.get("control_port", msg.get("port", send_port)))
+                return pi_ip, pi_port
+    finally:
+        sender_sock.close()
+        listen_sock.close()
+
+    if resolved_ip:
+        return resolved_ip, send_port
+    return send_ip, send_port
 
 def draw_maze():
     canvas.delete("maze")
@@ -312,6 +453,12 @@ port_entry.grid(row=2, column=1)
 
 ttk.Button(main_frame, text="Apply", command=apply_ip).grid(row=3, column=0, columnspan=2)
 ttk.Button(main_frame, text="Reset Ball", command=reset_ball_position).grid(row=4, column=0, columnspan=2, pady=(10, 0))
+
+apply_ip()
+auto_ip, auto_port = discover_pi_endpoint()
+apply_remote_endpoint(auto_ip, auto_port)
+send_position_subscribe(send_ip, send_port, POSITION_LISTEN_PORT)
+print(f"Active Pi endpoint: {send_ip}:{send_port}")
 
 # Set up UDP sender
 sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
