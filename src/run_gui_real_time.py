@@ -15,11 +15,18 @@ warnings.filterwarnings("ignore", message="X does not have valid feature names.*
 
 ROOT = Path(__file__).resolve().parents[1]  # repo root
 ARTIFACTS = ROOT / "artifacts"
+CLASS_MAPPING_PATH = ARTIFACTS / "class_mapping.json"
 
 
 # Load trained model and scaler
 model = joblib.load(ARTIFACTS/"mlp_model.pkl")
 scaler = joblib.load(ARTIFACTS/"minmax_scaler.pkl")
+
+if CLASS_MAPPING_PATH.exists():
+    with open(CLASS_MAPPING_PATH, "r", encoding="utf-8") as f:
+        class_mapping = {int(k): v for k, v in json.load(f).items()}
+else:
+    class_mapping = {0: "pointing", 1: "thumbs_up", 2: "okay_sign"}
 
 #Raspberry Pi IP and port for sending hand data via UDP
 
@@ -34,10 +41,10 @@ GUI_HANDSHAKE_REPLY_PORT = 53256
 POSITION_LISTEN_PORT = 6007
 
 GESTURE_TO_COMMAND = {
-    0: 1,  # pointing
-    1: 2,  # thumbs_up
-    2: 0,  # okay_sign -> neutral/no movement
+    "pointing": 1,
+    "thumbs_up": 2,
 }
+CONFIDENCE_THRESHOLD = 0.93
 
 
 # Maze dimensions in mm
@@ -55,6 +62,8 @@ step_size_mm = 7.0
 ball_pos = [ball_pos_mm[0] / MAX_WIDTH_MM, ball_pos_mm[1] / MAX_HEIGHT_MM]
 ball_radius = ball_radius_mm / MAX_WIDTH_MM  # scaled on x-axis
 step_size = step_size_mm / MAX_WIDTH_MM
+start_pos = [ball_x / MAX_WIDTH_MM, ball_y / MAX_HEIGHT_MM]
+reset_flag = False
 
 # Each wall is defined as (x1, y1, x2, y2)
 maze_walls_mm = [
@@ -161,25 +170,59 @@ def udp_listener():
             # Predict gestures, then map to command IDs used by try_move_ball.
             left_probs = model.predict_proba(left_scaled)[0]
             right_probs = model.predict_proba(right_scaled)[0]
+            x_class, left_name, left_conf = decode_movement_command(left_probs)
+            y_class, right_name, right_conf = decode_movement_command(right_probs)
 
-            # Confidence gate: if confidence is too low, treat as neutral command.
-            if np.max(left_probs) >= 0.93:
-                left_gesture = int(np.argmax(left_probs))
-                x_class = GESTURE_TO_COMMAND.get(left_gesture, 0)
+            reset_active = is_reset_gesture(left_name, left_conf) and is_reset_gesture(right_name, right_conf)
+            set_reset_flag(reset_active)
+
+            if reset_active:
+                step_ball_toward_start()
             else:
-                x_class = 0
+                try_move_ball(x_class, y_class)
 
-            if np.max(right_probs) >= 0.93:
-                right_gesture = int(np.argmax(right_probs))
-                y_class = GESTURE_TO_COMMAND.get(right_gesture, 0)
-            else:
-                y_class = 0
-
-            try_move_ball(x_class, y_class)
             send_target_position()
 
         except Exception as e:
             print(f"UDP listener error: {e}")
+
+
+def decode_movement_command(probabilities):
+    class_id = int(np.argmax(probabilities))
+    confidence = float(np.max(probabilities))
+    class_name = class_mapping.get(class_id, f"class_{class_id}")
+    if confidence < CONFIDENCE_THRESHOLD:
+        return 0, class_name, confidence
+    return GESTURE_TO_COMMAND.get(class_name, 0), class_name, confidence
+
+
+def is_reset_gesture(class_name: str, confidence: float) -> bool:
+    if confidence < CONFIDENCE_THRESHOLD:
+        return False
+    normalized = class_name.strip().lower()
+    return ("reset" in normalized) or (normalized in {"okay_sign", "ok_sign", "okay"})
+
+
+def set_reset_flag(enabled: bool):
+    global reset_flag
+    with position_lock:
+        reset_flag = bool(enabled)
+
+
+def step_ball_toward_start():
+    with position_lock:
+        dx = start_pos[0] - ball_pos[0]
+        dy = start_pos[1] - ball_pos[1]
+
+        if abs(dx) <= step_size:
+            ball_pos[0] = start_pos[0]
+        else:
+            ball_pos[0] += step_size if dx > 0 else -step_size
+
+        if abs(dy) <= step_size:
+            ball_pos[1] = start_pos[1]
+        else:
+            ball_pos[1] += step_size if dy > 0 else -step_size
 
 
 def resize_canvas(event):
@@ -231,6 +274,7 @@ def send_target_position():
     global target_seq
     with position_lock:
         x_norm, y_norm = ball_pos[0], ball_pos[1]
+        local_reset_flag = bool(reset_flag)
 
     # GUI frame (top-left origin) -> Pi frame (center origin, +Y up), in mm.
     x_mm_gui = x_norm * MAX_WIDTH_MM
@@ -242,6 +286,7 @@ def send_target_position():
         "type": "target_position",
         "x_mm": float(x_mm),
         "y_mm": float(y_mm),
+        "reset_flag": local_reset_flag,
         "seq": target_seq,
     }
     target_seq += 1

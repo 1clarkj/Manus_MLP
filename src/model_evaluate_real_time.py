@@ -14,9 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS = ROOT / "artifacts"
 
 GESTURE_TO_COMMAND = {
-    0: 1,  # pointing
-    1: 2,  # thumbs_up
-    2: 0,  # okay_sign (neutral)
+    "pointing": 1,
+    "thumbs_up": 2,
 }
 
 
@@ -42,8 +41,12 @@ def decode_prediction(probabilities, class_mapping, threshold):
     class_id = int(np.argmax(probabilities))
     confidence = float(np.max(probabilities))
     gesture_name = class_mapping.get(class_id, f"class_{class_id}")
-    command = GESTURE_TO_COMMAND.get(class_id, 0) if confidence >= threshold else 0
-    return class_id, gesture_name, confidence, command
+    command = GESTURE_TO_COMMAND.get(gesture_name, 0) if confidence >= threshold else 0
+    normalized = gesture_name.strip().lower()
+    reset_flag = confidence >= threshold and (
+        ("reset" in normalized) or (normalized in {"okay_sign", "ok_sign", "okay"})
+    )
+    return class_id, gesture_name, confidence, command, reset_flag
 
 
 def main():
@@ -98,17 +101,19 @@ def main():
             left_probs = model.predict_proba(left_scaled)[0]
             right_probs = model.predict_proba(right_scaled)[0]
 
-            l_id, l_name, l_conf, x_cmd = decode_prediction(
+            l_id, l_name, l_conf, x_cmd, l_reset = decode_prediction(
                 left_probs, class_mapping, args.threshold
             )
-            r_id, r_name, r_conf, y_cmd = decode_prediction(
+            r_id, r_name, r_conf, y_cmd, r_reset = decode_prediction(
                 right_probs, class_mapping, args.threshold
             )
+            reset_flag = l_reset or r_reset
 
             print(
                 f"Left: {l_name} ({l_conf:.3f}, class={l_id}) | "
                 f"Right: {r_name} ({r_conf:.3f}, class={r_id}) | "
-                f"Mapped command (x,y)=({x_cmd},{y_cmd})"
+                f"Mapped command (x,y)=({x_cmd},{y_cmd}) | "
+                f"reset_flag={int(reset_flag)}"
             )
     except KeyboardInterrupt:
         print("\nStopped.")
@@ -118,4 +123,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
